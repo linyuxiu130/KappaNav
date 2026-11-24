@@ -1,0 +1,244 @@
+"""Conditional Flow Transformer over physical curve coordinates."""
+
+import torch
+from torch import Tensor, nn
+from kappanav.local_planner.model.precision import NEURAL_DTYPE
+
+from kappanav.local_planner.model.configuration_space import sample_configuration_features
+from kappanav.local_planner.model.layers import RMSNorm
+from kappanav.local_planner.model.network.blocks import ConditionalTrajectoryBlock, ProjectedCondition, _GeometryCast
+from kappanav.local_planner.model.types import ConditionFeatures
+
+
+TRAJECTORY_DECODER_TYPE = "pointwise_geometry_increment_curve_flow_transformer"
+
+
+class FlowTimeEmbedding(nn.Module):
+    def __init__(self, model_dim: int) -> None:
+        super().__init__()
+        self.neural_dtype = NEURAL_DTYPE
+        self.projection = nn.Sequential(
+            nn.Linear(1, model_dim * 2),
+            nn.SiLU(),
+            nn.Linear(model_dim * 2, model_dim),
+        )
+
+    def forward(self, time: Tensor) -> Tensor:
+        # A scalar affine map is an outer product, not a K=1 GEMM.
+        affine = self.projection[0]
+        value = torch.addcmul(
+            affine.bias.to(self.neural_dtype),
+            time[:, None].to(self.neural_dtype),
+            affine.weight[:, 0].to(self.neural_dtype),
+        )
+        return self.projection[2](self.projection[1](value))
+
+
+class PlanarControlReadout(nn.Module):
+    """Apply one shared two-dimensional head to every increment token."""
+
+    def __init__(self, model_dim: int) -> None:
+        super().__init__()
+        self.neural_dtype = NEURAL_DTYPE
+        self.projection = nn.Linear(model_dim, 2)
+
+    def forward(self, tokens: Tensor) -> Tensor:
+        return self.projection(tokens).flatten(1)
+
+
+class ConditionalCurveFlowDecoder(nn.Module):
+    """Generate curve velocity from one shared scene-conditioned token stream."""
+
+    def __init__(
+        self,
+        *,
+        control_tokens: int,
+        coordinate_dim: int,
+        model_dim: int,
+        layers: int,
+        heads: int,
+        dropout: float,
+        planning_horizon_m: float,
+        path_to_increment_weight: Tensor,
+    ) -> None:
+        super().__init__()
+        self.neural_dtype = NEURAL_DTYPE
+        self.represented_geometry = True
+        self.control_tokens = control_tokens
+        self.coordinate_dim = coordinate_dim
+        self.planning_horizon_m = float(planning_horizon_m)
+        self.register_buffer(
+            "path_to_increment_weight",
+            path_to_increment_weight.float()
+            / path_to_increment_weight.float().sum(dim=-1, keepdim=True),
+            persistent=True,
+        )
+        self.state_embedding = nn.Linear(2, model_dim)
+        self.position_embedding = nn.Parameter(
+            torch.empty(1, control_tokens, model_dim)
+        )
+        self.time_embedding = FlowTimeEmbedding(model_dim)
+        # Step size of the sampler call: 0 is the instantaneous CFM velocity, a
+        # positive step asks for the jump of that size. Zero-initialised, so
+        # training starts from the plain flow field.
+        self.step_embedding = FlowTimeEmbedding(model_dim)
+        nn.init.zeros_(self.step_embedding.projection[2].weight)
+        nn.init.zeros_(self.step_embedding.projection[2].bias)
+        self.path_geometry_embedding = nn.Sequential(
+            nn.Linear(8, model_dim),
+            nn.SiLU(),
+            nn.Linear(model_dim, model_dim),
+        )
+        self.goal_geometry_embedding = nn.Sequential(
+            nn.Linear(5, model_dim),
+            nn.SiLU(),
+            nn.Linear(model_dim, model_dim),
+        )
+        self.blocks = nn.ModuleList(
+            ConditionalTrajectoryBlock(
+                model_dim,
+                heads,
+                dropout,
+            )
+            for _ in range(layers)
+        )
+        self.output_norm = RMSNorm(model_dim)
+        self.velocity_readout = PlanarControlReadout(model_dim)
+        nn.init.normal_(self.position_embedding, std=0.02)
+
+    def _trajectory_geometry(
+        self,
+        candidate_path: Tensor,
+        condition: ConditionFeatures,
+    ) -> tuple[Tensor, Tensor]:
+        observed = sample_configuration_features(
+            condition.configuration_field,
+            candidate_path,
+            self.planning_horizon_m,
+            represented_geometry=self.represented_geometry,
+        )
+        path_features = torch.cat(
+            (
+                candidate_path.float() / self.planning_horizon_m,
+                observed[..., :1] / self.planning_horizon_m,
+                observed[..., 1:],
+            ),
+            dim=-1,
+        )
+        return path_features, self._goal_geometry(candidate_path, condition)
+
+    def _embed_trajectory_geometry(
+        self, path_geometry: Tensor, goal_geometry: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        # Encode each position and its evidence together before reducing the
+        # curve. A nonlinear encoder of raw means loses local distributions.
+        with torch.autocast(device_type=path_geometry.device.type, dtype=self.neural_dtype):
+            path = self.path_geometry_embedding(path_geometry).float()
+            goal = self.goal_geometry_embedding(goal_geometry).float()
+        return (
+            torch.einsum("cp,bpd->bcd", self.path_to_increment_weight, path),
+            torch.einsum("cp,bpd->bcd", self.path_to_increment_weight, goal),
+        )
+
+    def _goal_geometry(
+        self,
+        candidate_path: Tensor,
+        condition: ConditionFeatures,
+    ) -> Tensor:
+        """Express intent as remaining displacement to one local endpoint."""
+        terminal_goal = condition.terminal_goal[:, None, :].expand_as(
+            candidate_path
+        )
+        goal_delta = terminal_goal - candidate_path.float()
+        return torch.cat(
+            (
+                candidate_path.float() / self.planning_horizon_m,
+                goal_delta / self.planning_horizon_m,
+                torch.linalg.vector_norm(goal_delta, dim=-1, keepdim=True)
+                / self.planning_horizon_m,
+            ),
+            dim=-1,
+        )
+
+    def _path_relative_geometry(
+        self,
+        query_position: Tensor,
+        condition: ConditionFeatures,
+    ) -> Tensor:
+        relative = (
+            condition.metric_position[:, None, :, :2]
+            - query_position[:, :, None, :].float()
+        ) / self.planning_horizon_m
+        vertical = (
+            condition.metric_position[:, None, :, 2:3] / self.planning_horizon_m
+        ).expand(-1, self.control_tokens, -1, -1)
+        # Pool the nonlinear distance before reducing path samples. Distance
+        # to a pooled position would discard the increment's extended support.
+        distance = torch.einsum(
+            "cp,bpnf->bcnf",
+            self.path_to_increment_weight,
+            torch.linalg.vector_norm(relative, dim=-1, keepdim=True),
+        )
+        relative = torch.einsum(
+            "cp,bpnf->bcnf", self.path_to_increment_weight, relative
+        )
+        return torch.cat(
+            (
+                relative,
+                vertical,
+                distance,
+                condition.surface_hit[:, None, :, None]
+                .expand(-1, self.control_tokens, -1, -1)
+                .to(relative.dtype),
+                condition.frame_age[:, None, :, None]
+                .expand(-1, self.control_tokens, -1, -1)
+                .to(relative.dtype),
+                condition.motion_token[:, None, :, None]
+                .expand(-1, self.control_tokens, -1, -1)
+                .to(relative.dtype),
+            ),
+            dim=-1,
+        )
+
+    def project_condition_memory(
+        self,
+        condition: ConditionFeatures,
+    ) -> tuple[ProjectedCondition, ...]:
+        """Cache only scene K/V; trajectory geometry changes with flow state."""
+        with torch.autocast(
+            device_type=condition.tokens.device.type, dtype=self.neural_dtype
+        ):
+            return tuple(
+                block.project_condition(condition) for block in self.blocks
+            )
+
+    def forward(
+        self,
+        state: Tensor,
+        time: Tensor,
+        step: Tensor,
+        candidate_path: Tensor,
+        condition: ConditionFeatures,
+        memory: tuple[ProjectedCondition, ...],
+    ) -> Tensor:
+        path_geometry, goal_geometry = self._trajectory_geometry(candidate_path, condition)
+        path_embedding, goal_embedding = self._embed_trajectory_geometry(
+            path_geometry, goal_geometry
+        )
+        pair_geometry = self._path_relative_geometry(candidate_path, condition)
+        with torch.autocast(device_type=state.device.type, dtype=self.neural_dtype):
+            tokens = self.state_embedding(state.reshape(-1, self.control_tokens, 2))
+            tokens = (
+                tokens
+                + self.position_embedding.to(tokens.dtype)
+                + self.time_embedding(time)[:, None]
+                + self.step_embedding(step)[:, None]
+                + path_embedding.to(tokens.dtype)
+                + (goal_embedding * condition.goal_present[:, :, None]).to(tokens.dtype)
+            )
+            neural_geometry = pair_geometry.detach().to(tokens.dtype)
+            for block, projected in zip(self.blocks, memory, strict=True):
+                tokens = block(tokens, projected, _GeometryCast.apply(pair_geometry, neural_geometry))
+            normalized = self.output_norm(tokens)
+            velocity = self.velocity_readout(normalized)
+            return velocity

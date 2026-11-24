@@ -1,0 +1,127 @@
+"""Shared depth backbone with timed metric scene evidence."""
+
+import torch
+from torch.nn import functional as F
+from torch import Tensor, nn
+from kappanav.local_planner.model.precision import NEURAL_DTYPE
+
+from kappanav.local_planner.model.layers import RMSNorm
+
+from kappanav.local_planner.model.encoders.geometry import MetricDepthProjector
+from kappanav.common.physical import ROBOT_FOOTPRINT_RADIUS_M, BODY_OBSTACLE_MIN_Z_M, ROBOT_COLLISION_TOP_Z_M
+
+
+
+
+def _channel_group_norm(channels: int) -> nn.GroupNorm:
+    return nn.GroupNorm(32, channels)
+
+
+class ResNet18BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1) -> None:
+        super().__init__()
+        self.convolution_1 = nn.Conv2d(
+            in_channels, out_channels, 3, stride=stride, padding=1, bias=False
+        )
+        self.norm_1 = _channel_group_norm(out_channels)
+        self.activation = nn.ReLU(inplace=True)
+        self.convolution_2 = nn.Conv2d(
+            out_channels, out_channels, 3, padding=1, bias=False
+        )
+        self.norm_2 = _channel_group_norm(out_channels)
+        self.skip = (
+            nn.Identity()
+            if stride == 1 and in_channels == out_channels
+            else nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),
+                _channel_group_norm(out_channels),
+            )
+        )
+
+    def forward(self, value: Tensor) -> Tensor:
+        residual = self.skip(value)
+        value = self.activation(self.norm_1(self.convolution_1(value)))
+        value = self.norm_2(self.convolution_2(value))
+        return self.activation(value + residual)
+
+
+def _resnet18_stage(in_channels: int, out_channels: int, stride: int) -> nn.Sequential:
+    return nn.Sequential(
+        ResNet18BasicBlock(in_channels, out_channels, stride),
+        ResNet18BasicBlock(out_channels, out_channels),
+    )
+
+
+class DepthObservationEncoder(nn.Module):
+    """Shared image backbone and learned embeddings for spatial-memory writes."""
+
+    def __init__(
+        self,
+        *,
+        model_dim: int,
+        frame_tokens_height: int,
+        frame_tokens_width: int,
+        dropout: float,
+        max_depth_m: float,
+        planning_horizon_m: float,
+        geometry=(ROBOT_FOOTPRINT_RADIUS_M, BODY_OBSTACLE_MIN_Z_M, ROBOT_COLLISION_TOP_Z_M),
+    ) -> None:
+        super().__init__()
+        self.neural_dtype = NEURAL_DTYPE
+        self.max_depth_m = float(max_depth_m)
+
+        self.backbone = nn.Sequential(
+            nn.Conv2d(2, 64, 7, stride=2, padding=3, bias=False),
+            _channel_group_norm(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(3, stride=2, padding=1),
+            _resnet18_stage(64, 64, 1),
+            _resnet18_stage(64, 128, 2),
+            _resnet18_stage(128, 256, 2),
+        )
+        self.spatial_projection = nn.Conv2d(256, model_dim, 1)
+        self.metric_projector = MetricDepthProjector(
+            frame_tokens_height,
+            frame_tokens_width,
+            max_depth_m,
+            planning_horizon_m, geometry,
+        )
+        self.geometry_projection = nn.Sequential(
+            nn.Linear(6, model_dim),
+            nn.SiLU(),
+            nn.Linear(model_dim, model_dim),
+        )
+        self.time_projection = nn.Sequential(
+            nn.Linear(1, model_dim), nn.SiLU(), nn.Linear(model_dim, model_dim)
+        )
+        self.output_norm = RMSNorm(model_dim)
+
+    @staticmethod
+    def sample_pixel_features(features: Tensor, indices: Tensor, image_width: int) -> Tensor:
+        """Lift features at the exact selected depth pixel, on the stride-16 lattice.
+
+        Symmetric odd-kernel padding gives feature centre i at input index 16*i.
+        align_corners=False maps that index explicitly; border extension is the
+        defined interpolation outside the final feature centre, not a new ray.
+        """
+        x = (indices % image_width).float() / 16
+        y = (indices // image_width).float() / 16
+        grid = torch.stack((2 * (x + .5) / features.shape[-1] - 1,
+                            2 * (y + .5) / features.shape[-2] - 1), dim=-1)
+        # FP32 sampling preserves pixel coordinates under neural BF16 autocast.
+        sampled = F.grid_sample(features.float(), grid.flatten(0, 1).unsqueeze(1),
+                                mode="bilinear", padding_mode="border", align_corners=False)
+        return sampled.squeeze(2).transpose(1, 2).reshape(*indices.shape, features.shape[1]).to(features.dtype)
+
+    def image_features(self, depth: Tensor) -> Tensor:
+        """Full-image CNN for independent depth[N,1,H,W] frames."""
+        visual_input = torch.cat((depth.float(), (depth > 0).float()), dim=1)
+        with torch.autocast(device_type=depth.device.type, dtype=self.neural_dtype):
+            return self.spatial_projection(self.backbone(visual_input))
+
+    def encode_pixels(self, visual: Tensor, geometry: Tensor, ages: Tensor, indices: Tensor) -> Tensor:
+        """Join pixel evidence in FP32 before reducing observations into cells."""
+        time = F.embedding(indices, self.time_projection(ages))
+        return self.output_norm(visual + self.geometry_projection(geometry) + time)

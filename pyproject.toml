@@ -3,34 +3,28 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "curvenav-navigation"
+name = "kappanav"
 version = "1.0.0"
-description = "CurveNav: PointGoal-conditioned smooth metric local navigation"
+description = "KappaNav: air-ground collaborative navigation (overhead traversability, global route, CurveNav local planner)"
 requires-python = ">=3.10"
 dependencies = [
   "torch>=2.6,<2.8",
   "numpy>=1.24",
   "scipy>=1.10",
-  "matplotlib>=3.7",
   "PyYAML>=6.0",
-  "accelerate>=1.14",
+  "numba>=0.59",
 ]
 
-[project.scripts]
-curvenav-train = "curvenav.training.train:main"
-curvenav-prepare-data = "curvenav.data.prepare:main"
-curvenav-evaluate = "curvenav.evaluation.offline:main"
-curvenav-compare = "curvenav.evaluation.compare:main"
-curvenav-finetune-evaluator = "curvenav.training.evaluator_finetune:main"
 
 [project.optional-dependencies]
-generation = ["trimesh>=4.0"]
 test = ["pytest>=8.0"]
+global = ["transformers>=4.57,<4.58", "Pillow", "opencv-python-headless"]
+geotiff = ["rasterio"]
 
 [tool.setuptools.packages.find]
-where = ["src"]
+include = ["kappanav*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["online_evaluation"]
+pythonpath = [".", "tests", "tests/common", "tests/global_planner", "tests/local_planner", "tests/evaluation"]
 addopts = "-ra"

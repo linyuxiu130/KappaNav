@@ -1,20 +1,40 @@
-# 训练数据
+# 数据目录
 
-当前唯一训练入口为 `data/policy_dataset-depth-clearance/config.yaml`。
-`bash scripts/build_dataset.sh` 生成并审计专家路线，然后直接编译为训练格式。
+`data/` 不进版本库。脚本的默认路径指向以下位置：
 
-| 目录 | 用途 |
-| --- | --- |
-| `scene_assets/hssd-hab/` | HSSD 场景、网格和材质 |
-| `../outputs/hssd_policy_depth_500_clearance/` | 500 条专家路线、10 Hz 深度与标定位姿、源配置空间和审计 |
-| `policy_dataset-depth-clearance/` | 训练/验证标签、深度索引和训练集拟合的归一化配置 |
+| 位置 | 内容 | 产生者 |
+|---|---|---|
+| `model/policy.pt` | 部署模型 | `scripts/local_planner/train.sh`（EMA 权重） |
+| `model/initial.pt` | 初始模型：归一化与训练集一致，采集时用于录制 Q 的固定候选 | `python -m kappanav.local_planner.data.prepare_replay` |
+| `scenes/{grs,hssd}/navigation/train/<scene>/` | 训练场景几何：`scene.navmesh`、`navigation.npz`（5 cm C-space）、`scene.json` | `scripts/local_planner/prepare_data.sh` |
+| `scenes/tasks.json` | 训练任务目录 | `scripts/local_planner/prepare_data.sh` |
+| `dataset/` | 训练集：`captures/<case_id>/`（原始采集）、`shards/<grid_sha>/`（训练分片）、`train/`、`validation/`、`dataset.json` | `scripts/local_planner/prepare_data.sh` |
+| `benchmark/pointgoal/` | 官方起终点（每场景 100 对），来源与哈希见 `PROVENANCE.json` | 导入 |
+| `benchmark/assets/` | 40 个测评场景的 Habitat 资源 | `scripts/evaluation/prepare_benchmark.sh` |
+| `benchmark/navigation/<scene>/` | 测评地图 | `scripts/evaluation/prepare_benchmark.sh` |
+| `benchmark/tasks.json` | 测评任务清单（4000 回合） | `scripts/evaluation/prepare_benchmark.sh` |
 
-400 条路线用于训练，100 条用于验证，按场景隔离。深度直接保存为训练需要的
-224×126 FP16 光学深度；四帧历史通过索引引用，不重复保存图像。
-内参、外参、相对 SE(3) 位姿和时间戳使用统一观测合同。
+- 训练分片的 `raw/*.npy` 是 `captures/*/depths.npy` 的硬链接，二者须在同一文件系统。
+- `capture.json` 的哈希是训练行的身份，也是重标注目标的随机种子；已完成的采集文件不原地修改。
+- 相同输入重跑 `prepare_data.sh` 会复用已完成的场景；输入改变时使用新的 `OUT` 目录。
 
-专家曲线保存七个二维非原点 B-spline 控制点；原点固定。模型边界将控制点转换为
-标准化控制增量，解码后恢复米制轨迹。源配置空间用于数据审核和测评，不作为在线输入。
+外部位置在 `scripts/common_env.sh` 中设定，均可由同名环境变量覆盖：
 
-生成完成需通过源几何审计与训练标签重新查询证书。旧 RGB-D / forward 数据集已清理；
-数据、场景及模型权重留在本地，不提交 Git。
+| 变量 | 内容 |
+|---|---|
+| `KAPPANAV_PYTHON` | 训练、采集与 Habitat 测评的 Python 环境 |
+| `KAPPANAV_ISAAC_PYTHON` | Isaac Sim 5.0 测评的 Python 环境 |
+| `KAPPANAV_ASSETS` | 源场景与机器人（`training/grscenes-hab`、`evaluation/scenes`、`evaluation/robots/dingo.usd`） |
+| `KAPPANAV_HSSD` | HSSD 训练场景 |
+| `KAPPANAV_RUNTIME` | 运行库，见下表 |
+
+运行库（`$KAPPANAV_RUNTIME`）：
+
+| 位置 | 内容 |
+|---|---|
+| `habitat_dingo_0_3_3/`、`navbench_aux/` | Habitat 与辅助 Python 包 |
+| `acados/` | MPC 求解器 |
+| `navbench_build_sources/` | Isaac Lab（以可编辑方式安装在 Isaac 测评环境中） |
+| `apps/` | Isaac Lab 的 Kit 应用配置 |
+| `isaac_kit/` | Omniverse Kit |
+| `isaac_torch/` | Isaac 测评使用的 torch（与训练环境相同版本） |
